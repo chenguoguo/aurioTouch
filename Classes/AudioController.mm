@@ -67,10 +67,12 @@ struct CallbackData {
     AudioUnit               rioUnit;
     BufferManager*          bufferManager;
     DCRejectionFilter*      dcRejectionFilter;
+    snowboy::SnowboyDetect* snowboyDetect;
+    AVAudioPlayer*          detectionPlayer;
     BOOL*                   muteAudio;
     BOOL*                   audioChainIsBeingReconstructed;
     
-    CallbackData(): rioUnit(NULL), bufferManager(NULL), muteAudio(NULL), audioChainIsBeingReconstructed(NULL) {}
+    CallbackData(): rioUnit(NULL), bufferManager(NULL), snowboyDetect(NULL), detectionPlayer(NULL), muteAudio(NULL), audioChainIsBeingReconstructed(NULL) {}
 } cd;
 
 // Render callback function
@@ -87,20 +89,38 @@ static OSStatus	performRender (void                         *inRefCon,
         // we are calling AudioUnitRender on the input bus of AURemoteIO
         // this will store the audio data captured by the microphone in ioData
         err = AudioUnitRender(cd.rioUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, ioData);
-        
+
+        // Creates Float32 data that is required by the original app.
+        Float32 *float32_data = new Float32[inNumberFrames];
+        for (UInt32 i = 0; i < inNumberFrames; i++)
+        {
+            float32_data[i] = (Float32) (((SInt16 *) ioData->mBuffers[0].mData)[i]) / ((Float32) 32768);
+        }
+
+        // Runs detection.
+        if (cd.snowboyDetect != NULL)
+        {
+            int result = cd.snowboyDetect->RunDetection((SInt16 *) ioData->mBuffers[0].mData, inNumberFrames);
+            if (result > 0)
+            {
+                NSLog(@"Snowboy");
+                [cd.detectionPlayer play];
+            }
+        }
+
         // filter out the DC component of the signal
-        cd.dcRejectionFilter->ProcessInplace((Float32*) ioData->mBuffers[0].mData, inNumberFrames);
+        cd.dcRejectionFilter->ProcessInplace(float32_data, inNumberFrames);
         
         // based on the current display mode, copy the required data to the buffer manager
         if (cd.bufferManager->GetDisplayMode() == aurioTouchDisplayModeOscilloscopeWaveform)
         {
-            cd.bufferManager->CopyAudioDataToDrawBuffer((Float32*)ioData->mBuffers[0].mData, inNumberFrames);
+            cd.bufferManager->CopyAudioDataToDrawBuffer(float32_data, inNumberFrames);
         }
         
         else if ((cd.bufferManager->GetDisplayMode() == aurioTouchDisplayModeSpectrum) || (cd.bufferManager->GetDisplayMode() == aurioTouchDisplayModeOscilloscopeFFT))
         {
             if (cd.bufferManager->NeedsNewFFTData())
-                cd.bufferManager->CopyAudioDataToFFTInputBuffer((Float32*)ioData->mBuffers[0].mData, inNumberFrames);
+                cd.bufferManager->CopyAudioDataToFFTInputBuffer(float32_data, inNumberFrames);
         }
         
         // mute audio if needed
@@ -109,6 +129,9 @@ static OSStatus	performRender (void                         *inRefCon,
             for (UInt32 i=0; i<ioData->mNumberBuffers; ++i)
                 memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
         }
+
+        // Deletes Float32 data.
+        delete[] float32_data;
     }
     
     return err;
@@ -120,6 +143,7 @@ static OSStatus	performRender (void                         *inRefCon,
 - (void)setupAudioSession;
 - (void)setupIOUnit;
 - (void)createButtonPressedSound;
+- (void)createDetectionSound;
 - (void)setupAudioChain;
 
 @end
@@ -133,6 +157,7 @@ static OSStatus	performRender (void                         *inRefCon,
     if (self = [super init]) {
         _bufferManager = NULL;
         _dcRejectionFilter = NULL;
+        _snowboyDetect = NULL;
         _muteAudio = YES;
         [self setupAudioChain];
     }
@@ -209,8 +234,10 @@ static OSStatus	performRender (void                         *inRefCon,
     // rebuild the audio chain
     delete _bufferManager;      _bufferManager = NULL;
     delete _dcRejectionFilter;  _dcRejectionFilter = NULL;
+    delete _snowboyDetect;      _snowboyDetect = NULL;
     [_audioPlayer release]; _audioPlayer = nil;
-    
+    [_detectionPlayer release]; _detectionPlayer = nil;
+
     [self setupAudioChain];
     [self startIOUnit];
     
@@ -228,13 +255,13 @@ static OSStatus	performRender (void                         *inRefCon,
         [sessionInstance setCategory:AVAudioSessionCategoryPlayAndRecord error:&error];
         XThrowIfError((OSStatus)error.code, "couldn't set session's audio category");
         
-        // set the buffer duration to 5 ms
-        NSTimeInterval bufferDuration = .005;
+        // set the buffer duration to 100 ms
+        NSTimeInterval bufferDuration = .1;
         [sessionInstance setPreferredIOBufferDuration:bufferDuration error:&error];
         XThrowIfError((OSStatus)error.code, "couldn't set session's I/O buffer duration");
         
         // set the session's sample rate
-        [sessionInstance setPreferredSampleRate:44100 error:&error];
+        [sessionInstance setPreferredSampleRate:16000 error:&error];
         XThrowIfError((OSStatus)error.code, "couldn't set session's preferred sample rate");
         
         // add interruption handler
@@ -295,9 +322,9 @@ static OSStatus	performRender (void                         *inRefCon,
         XThrowIfError(AudioUnitSetProperty(_rioUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &one, sizeof(one)), "could not enable output on AURemoteIO");
         
         // Explicitly set the input and output client formats
-        // sample rate = 44100, num channels = 1, format = 32 bit floating point
+        // sample rate = 16000, num channels = 1, format = 16 bit signed-integer
         
-        CAStreamBasicDescription ioFormat = CAStreamBasicDescription(44100, 1, CAStreamBasicDescription::kPCMFormatFloat32, false);
+        CAStreamBasicDescription ioFormat = CAStreamBasicDescription(16000, 1, CAStreamBasicDescription::kPCMFormatInt16, false);
         XThrowIfError(AudioUnitSetProperty(_rioUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &ioFormat, sizeof(ioFormat)), "couldn't set the input client format on AURemoteIO");
         XThrowIfError(AudioUnitSetProperty(_rioUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &ioFormat, sizeof(ioFormat)), "couldn't set the output client format on AURemoteIO");
         
@@ -312,6 +339,10 @@ static OSStatus	performRender (void                         *inRefCon,
         
         _bufferManager = new BufferManager(maxFramesPerSlice);
         _dcRejectionFilter = new DCRejectionFilter;
+        _snowboyDetect = new snowboy::SnowboyDetect(std::string([[[NSBundle mainBundle]pathForResource:@"common" ofType:@"res"] UTF8String]),
+                                                    std::string([[[NSBundle mainBundle]pathForResource:@"snowboy" ofType:@"umdl"] UTF8String]));
+        _snowboyDetect->SetSensitivity("0.45");        // Sensitivity for each hotword
+        _snowboyDetect->SetAudioGain(2.0);             // Audio gain for detection
         
         // We need references to certain data in the render callback
         // This simple struct is used to hold that information
@@ -319,6 +350,8 @@ static OSStatus	performRender (void                         *inRefCon,
         cd.rioUnit = _rioUnit;
         cd.bufferManager = _bufferManager;
         cd.dcRejectionFilter = _dcRejectionFilter;
+        cd.snowboyDetect = _snowboyDetect;
+        cd.detectionPlayer = _detectionPlayer;
         cd.muteAudio = &_muteAudio;
         cd.audioChainIsBeingReconstructed = &_audioChainIsBeingReconstructed;
         
@@ -354,16 +387,34 @@ static OSStatus	performRender (void                         *inRefCon,
     CFRelease(url);
 }
 
+- (void)createDetectionSound
+{
+    NSError *error;
+
+    CFURLRef url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, CFStringRef([[NSBundle mainBundle] pathForResource:@"detection" ofType:@"caf"]), kCFURLPOSIXPathStyle, false);
+    _detectionPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:(NSURL*)url error:&error];
+
+    XThrowIfError((OSStatus)error.code, "couldn't create AVAudioPlayer");
+
+    CFRelease(url);
+}
+
 - (void)playButtonPressedSound
 {
     [_audioPlayer play];
 }
 
+- (void)playDetectionSound
+{
+    [_detectionPlayer play];
+}
+
 - (void)setupAudioChain
 {
     [self setupAudioSession];
-    [self setupIOUnit];
     [self createButtonPressedSound];
+    [self createDetectionSound];
+    [self setupIOUnit];
 }
 
 - (OSStatus)startIOUnit
@@ -398,8 +449,10 @@ static OSStatus	performRender (void                         *inRefCon,
 - (void)dealloc
 {
     delete _bufferManager;      _bufferManager = NULL;
+    delete _snowboyDetect;      _snowboyDetect = NULL;
     delete _dcRejectionFilter;  _dcRejectionFilter = NULL;
     [_audioPlayer release];     _audioPlayer = nil;
+    [_detectionPlayer release];     _detectionPlayer = nil;
     
     [super dealloc];
 }

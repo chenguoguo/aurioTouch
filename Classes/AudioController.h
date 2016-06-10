@@ -52,6 +52,7 @@
 
 #import "BufferManager.h"
 #import "DCRejectionFilter.h"
+#import "snowboy-detect.h"
 
 
 @interface AudioController : NSObject {
@@ -60,6 +61,8 @@
     BufferManager*          _bufferManager;
     DCRejectionFilter*      _dcRejectionFilter;
     AVAudioPlayer*          _audioPlayer;   // for button pressed sound
+    AVAudioPlayer*          _detectionPlayer;   // for detection sound
+    snowboy::SnowboyDetect* _snowboyDetect;     // Detector.
     BOOL                    _audioChainIsBeingReconstructed;
 }
 
@@ -70,6 +73,7 @@
 - (OSStatus)    startIOUnit;
 - (OSStatus)    stopIOUnit;
 - (void)        playButtonPressedSound;
+- (void)        playDetectionSound;
 - (double)      sessionSampleRate;
 
 @end
